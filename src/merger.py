@@ -4,6 +4,7 @@ Data merger module for merging sheets from CSV/XLSX files.
 import pandas as pd
 import io
 import re
+import duckdb
 from typing import List, Optional
 
 
@@ -19,7 +20,8 @@ class DataMerger:
         merge_type: str,
         file_type: str,
         matching_mode: str = 'exact',
-        substring_direction: str = 'left_contains_right'
+        substring_direction: str = 'left_contains_right',
+        progress_callback=None
     ) -> pd.DataFrame:
         """
         Merge two sheets based on specified columns.
@@ -76,7 +78,7 @@ class DataMerger:
         if matching_mode == 'substring':
             merged_df = self._merge_with_substring(
                 df_left, df_right, left_cols, right_cols, 
-                how, substring_direction
+                how, substring_direction, progress_callback=progress_callback
             )
         else:
             # Exact matching - original logic
@@ -111,7 +113,8 @@ class DataMerger:
         left_cols: List[str],
         right_cols: List[str],
         how: str,
-        substring_direction: str
+        substring_direction: str,
+        progress_callback=None
     ) -> pd.DataFrame:
         """
         Merge dataframes using substring matching.
@@ -198,59 +201,135 @@ class DataMerger:
                 lambda row: '|'.join([clean_key(val) for val in row]), axis=1
             )
         
+        # Optimize: Pre-compute lowercase versions to avoid repeated conversions
+        df_left['_merge_key_left_lower'] = df_left['_merge_key_left'].str.lower()
+        df_left['_original_left_lower'] = df_left['_original_left'].str.lower()
+        df_right['_merge_key_right_lower'] = df_right['_merge_key_right'].str.lower()
+        df_right['_original_right_lower'] = df_right['_original_right'].str.lower()
+        
         # Create a mapping based on substring matching
         matches = []
         
+        # Filter out empty keys upfront for better performance
+        left_mask = df_left['_merge_key_left'] != ''
+        right_mask = df_right['_merge_key_right'] != ''
+        
+        df_left_filtered = df_left[left_mask].copy()
+        df_right_filtered = df_right[right_mask].copy()
+        
+        # Build lookup dictionaries for faster access
+        right_by_key = {}
+        right_by_key_lower = {}
+        for idx_right, row_right in df_right_filtered.iterrows():
+            key = row_right['_merge_key_right']
+            key_lower = row_right['_merge_key_right_lower']
+            if key not in right_by_key:
+                right_by_key[key] = []
+            right_by_key[key].append(idx_right)
+            if key_lower not in right_by_key_lower:
+                right_by_key_lower[key_lower] = []
+            right_by_key_lower[key_lower].append(idx_right)
+        
+        left_by_key = {}
+        left_by_key_lower = {}
+        for idx_left, row_left in df_left_filtered.iterrows():
+            key = row_left['_merge_key_left']
+            key_lower = row_left['_merge_key_left_lower']
+            if key not in left_by_key:
+                left_by_key[key] = []
+            left_by_key[key].append(idx_left)
+            if key_lower not in left_by_key_lower:
+                left_by_key_lower[key_lower] = []
+            left_by_key_lower[key_lower].append(idx_left)
+        
+        # Use DuckDB for fast substring matching
+        # DuckDB is much faster for complex queries on large datasets
+        con = duckdb.connect()
+        
+        # Register DataFrames with DuckDB
+        con.register('left_df', df_left_filtered.reset_index())
+        con.register('right_df', df_right_filtered.reset_index())
+        
+        if progress_callback:
+            progress_callback(20)
+        
+        # Step 1: Exact matches using DuckDB (very fast)
+        exact_query = """
+        SELECT 
+            l.index as left_idx,
+            r.index as right_idx
+        FROM left_df l
+        INNER JOIN right_df r
+        ON l._merge_key_left = r._merge_key_right
+        """
+        exact_results = con.execute(exact_query).fetchdf()
+        
+        for _, row in exact_results.iterrows():
+            matches.append({
+                'left_idx': int(row['left_idx']),
+                'right_idx': int(row['right_idx'])
+            })
+        
+        if progress_callback:
+            progress_callback(40)
+        
+        # Step 2: Substring matches using DuckDB LIKE operator
         if substring_direction == 'left_contains_right':
-            # Left column contains right column value
-            for idx_left, left_key in enumerate(df_left['_merge_key_left']):
-                if not left_key:  # Skip empty keys
-                    continue
-                left_key_lower = left_key.lower()
-                left_original = df_left.loc[idx_left, '_original_left'].lower()
-                
-                for idx_right, right_key in enumerate(df_right['_merge_key_right']):
-                    if not right_key:  # Skip empty keys
-                        continue
-                    right_key_lower = right_key.lower()
-                    right_original = df_right.loc[idx_right, '_original_right'].lower()
-                    
-                    # Check multiple matching strategies:
-                    # 1. Normalized keys match exactly (handles number extraction)
-                    # 2. Normalized right_key is substring of normalized left_key
-                    # 3. Original right_original is substring of original left_original
-                    if (left_key == right_key or  # Exact match after normalization
-                        right_key_lower in left_key_lower or  # Normalized substring
-                        right_original in left_original):  # Original substring
-                        matches.append({
-                            'left_idx': idx_left,
-                            'right_idx': idx_right
-                        })
+            # Left contains right: right_key should be substring of left_key
+            substring_query = """
+            SELECT DISTINCT
+                l.index as left_idx,
+                r.index as right_idx
+            FROM left_df l
+            CROSS JOIN right_df r
+            WHERE 
+                (l._merge_key_left != r._merge_key_right) AND
+                (
+                    (r._merge_key_right_lower != '' AND l._merge_key_left_lower LIKE '%' || r._merge_key_right_lower || '%') OR
+                    (r._original_right_lower != '' AND l._original_left_lower LIKE '%' || r._original_right_lower || '%')
+                )
+            """
         else:  # right_contains_left
-            # Right column contains left column value
-            for idx_left, left_key in enumerate(df_left['_merge_key_left']):
-                if not left_key:  # Skip empty keys
-                    continue
-                left_key_lower = left_key.lower()
-                left_original = df_left.loc[idx_left, '_original_left'].lower()
-                
-                for idx_right, right_key in enumerate(df_right['_merge_key_right']):
-                    if not right_key:  # Skip empty keys
-                        continue
-                    right_key_lower = right_key.lower()
-                    right_original = df_right.loc[idx_right, '_original_right'].lower()
-                    
-                    # Check multiple matching strategies:
-                    # 1. Normalized keys match exactly (handles number extraction)
-                    # 2. Normalized left_key is substring of normalized right_key
-                    # 3. Original left_original is substring of original right_original
-                    if (left_key == right_key or  # Exact match after normalization
-                        left_key_lower in right_key_lower or  # Normalized substring
-                        left_original in right_original):  # Original substring
-                        matches.append({
-                            'left_idx': idx_left,
-                            'right_idx': idx_right
-                        })
+            # Right contains left: left_key should be substring of right_key
+            substring_query = """
+            SELECT DISTINCT
+                l.index as left_idx,
+                r.index as right_idx
+            FROM left_df l
+            CROSS JOIN right_df r
+            WHERE 
+                (l._merge_key_left != r._merge_key_right) AND
+                (
+                    (l._merge_key_left_lower != '' AND r._merge_key_right_lower LIKE '%' || l._merge_key_left_lower || '%') OR
+                    (l._original_left_lower != '' AND r._original_right_lower LIKE '%' || l._original_left_lower || '%')
+                )
+            """
+        
+        if progress_callback:
+            progress_callback(60)
+        
+        # Execute substring query - DuckDB handles this efficiently
+        substring_results = con.execute(substring_query).fetchdf()
+        
+        if progress_callback:
+            progress_callback(80)
+        
+        # Add substring matches (avoid duplicates with exact matches)
+        exact_pairs = set((int(row['left_idx']), int(row['right_idx'])) for _, row in exact_results.iterrows())
+        
+        for _, row in substring_results.iterrows():
+            left_idx = int(row['left_idx'])
+            right_idx = int(row['right_idx'])
+            if (left_idx, right_idx) not in exact_pairs:
+                matches.append({
+                    'left_idx': left_idx,
+                    'right_idx': right_idx
+                })
+        
+        con.close()
+        
+        if progress_callback:
+            progress_callback(90)
         
         if not matches:
             # No matches found
@@ -323,7 +402,9 @@ class DataMerger:
             )
         
         # Clean up temporary columns
-        cols_to_drop = ['_merge_key_left', '_merge_key_right', '_original_left', '_original_right', 'left_idx', 'right_idx']
+        cols_to_drop = ['_merge_key_left', '_merge_key_right', '_original_left', '_original_right', 
+                        '_merge_key_left_lower', '_merge_key_right_lower', '_original_left_lower', '_original_right_lower',
+                        'left_idx', 'right_idx']
         cols_to_drop = [col for col in cols_to_drop if col in merged_df.columns]
         merged_df = merged_df.drop(columns=cols_to_drop)
         

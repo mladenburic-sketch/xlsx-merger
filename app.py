@@ -178,6 +178,25 @@ if uploaded_file is not None:
                 
                 with st.spinner("Merging sheets..."):
                     try:
+                        # Show progress for substring matching
+                        progress_bar = None
+                        status_text = None
+                        if matching_mode_internal == 'substring':
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+                            status_text.text("Preparing data...")
+                            
+                            def update_progress(percent):
+                                if progress_bar:
+                                    progress_bar.progress(percent)
+                                    if percent < 50:
+                                        status_text.text(f"Finding exact matches... {percent}%")
+                                    else:
+                                        status_text.text(f"Finding substring matches... {percent}%")
+                        else:
+                            def update_progress(percent):
+                                pass
+                        
                         merged_df = merger.merge_sheets(
                             uploaded_file,
                             left_sheet,
@@ -186,8 +205,13 @@ if uploaded_file is not None:
                             merge_type,
                             file_info['type'],
                             matching_mode=matching_mode_internal,
-                            substring_direction=substring_direction_internal
+                            substring_direction=substring_direction_internal,
+                            progress_callback=update_progress if matching_mode_internal == 'substring' else None
                         )
+                        
+                        if matching_mode_internal == 'substring' and progress_bar:
+                            progress_bar.progress(100)
+                            status_text.text("Merge completed!")
                         st.session_state.merged_data = merged_df
                         if len(merged_df) == 0:
                             st.warning("⚠️ No rows matched! Please check:")
