@@ -37,3 +37,13 @@ streamlit run app.py
 - Streamlit
 - Pandas
 - openpyxl (for XLSX support)
+- DuckDB (for fast substring matching on large datasets)
+
+## Streamlit Cloud Deployment
+
+To deploy on Streamlit Cloud:
+1. Push your code to GitHub
+2. Go to [share.streamlit.io](https://share.streamlit.io)
+3. Connect your GitHub repository
+4. Set the main file path to `app.py`
+5. Streamlit Cloud will automatically install dependencies from `requirements.txt`
